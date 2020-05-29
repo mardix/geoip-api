@@ -18,5 +18,5 @@ serde = "1"
 serde_derive = "1"
 serde_json = "1"
 maxminddb = { version = "0.13.0", features = ["mmap"] }
-memmap = "0.7.0"
-dotenv = "0.15.0"
+memmap = "0.7"
+dotenv = "0.15"
