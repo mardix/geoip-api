@@ -15,27 +15,49 @@
 #[macro_use]
 extern crate serde_derive;
 
-use std::env;
+use env_logger;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use actix_cors::Cors;
 use actix_web::http::HeaderMap;
 use actix_web::web;
 use actix_web::App;
 use actix_web::HttpRequest;
-use actix_web::HttpResponse;
+use actix_web::Responder;
 use actix_web::HttpServer;
 use maxminddb::geoip2::City;
-use maxminddb::MaxMindDBError;
-use maxminddb::Reader;
-use memmap::Mmap;
 use serde_json;
+use std::net::SocketAddr;
+use structopt::StructOpt;
+use geoipupdate::MaxMindReader;
+
+mod geoipupdate;
+
+#[derive(StructOpt, Debug, Clone)]
+struct Options {
+    #[structopt(
+        short,
+        long,
+        env = "GEOIP_RS_LISTEN_ADDR",
+        default_value = "127.0.0.1:3000"
+    )]
+    listen_addr: SocketAddr,
+    #[structopt(long, env = "GEOIP_RS_UPDATE_MINUTES", default_value = "30")]
+    update_minutes: u64,
+    #[structopt(long, env = "GEOIP_RS_ACCOUNT_ID")]
+    account_id: String,
+    #[structopt(long, env = "GEOIP_RS_LICENSE_KEY")]
+    license_key: String,
+    #[structopt(long, env = "GEOIP_RS_EDITION_ID", default_value = "GeoIP2-City")]
+    edition_id: String,
+}
 
 #[derive(Serialize)]
 struct NonResolvedIPResponse<'a> {
     pub ip_address: &'a str,
+    pub error: &'a str
 }
 
 #[derive(Serialize)]
@@ -89,16 +111,26 @@ fn get_language(lang: Option<String>) -> String {
 }
 
 struct Db {
-    db: Arc<Reader<Mmap>>,
+    db: Arc<RwLock<MaxMindReader>>,
 }
 
-async fn index(req: HttpRequest, data: web::Data<Db>, web::Query(query): web::Query<QueryParams>) -> HttpResponse {
+async fn index(
+    req: HttpRequest,
+    data: web::Data<Db>,
+    web::Query(query): web::Query<QueryParams>,
+) -> impl Responder {
     let language = get_language(query.lang);
     let ip_address = ip_address_to_resolve(query.ip, req.headers(), req.connection_info().remote());
 
-    let lookup: Result<City, MaxMindDBError> = data.db.lookup(ip_address.parse().unwrap());
+    let db_opt = data.db.as_ref().read().unwrap();
+    let lookup: Result<City, Box<dyn std::error::Error>> = if let Some(db) = &*db_opt {
+        db.lookup(ip_address.parse().unwrap())
+            .map_err(|e| format!("Could not query maxmind database: {}", e).into())
+    } else {
+        Err("Maxmind database not found".into())
+    };
 
-    let geoip = match lookup {
+    match lookup {
         Ok(geoip) => {
             let region = geoip
                 .subdivisions
@@ -190,44 +222,32 @@ async fn index(req: HttpRequest, data: web::Data<Db>, web::Query(query): web::Qu
             };
             serde_json::to_string(&res)
         }
-        Err(_) => serde_json::to_string(&NonResolvedIPResponse {
+        Err(e) => serde_json::to_string(&NonResolvedIPResponse {
             ip_address: &ip_address,
+            error: &e.to_string()
         }),
     }
-    .unwrap();
-
-    match query.callback {
-        Some(callback) => HttpResponse::Ok()
-            .content_type("application/javascript; charset=utf-8")
-            .body(format!(";{}({});", callback, geoip)),
-        None => HttpResponse::Ok()
-            .content_type("application/json; charset=utf-8")
-            .body(geoip),
-    }
+    .unwrap()
 }
 
-fn db_file_path() -> String {
-    if let Ok(file) = env::var("GEOIP_RS_DB_PATH") {
-        return file;
-    }
-
-    let args: Vec<String> = env::args().collect();
-    if args.len() > 1 {
-        return args[1].to_string();
-    }
-
-    panic!("You must specify the db path, either as a command line argument or as GEOIP_RS_DB_PATH env var");
-}
 #[actix_rt::main]
 async fn main() {
-    dotenv::from_path(".env").ok();
+    env_logger::init();
+    let opt = Options::from_args();
+    let listen_addr = opt.listen_addr;
 
-    let host = env::var("GEOIP_RS_HOST").unwrap_or_else(|_| String::from("127.0.0.1"));
-    let port = env::var("GEOIP_RS_PORT").unwrap_or_else(|_| String::from("3000"));
+    println!("Listening on http://{}", listen_addr);
 
-    println!("Listening on http://{}:{}", host, port);
+    let db = Arc::new(RwLock::new(None));
 
-    let db = Arc::new(Reader::open_mmap(db_file_path()).unwrap());
+    let updater = geoipupdate::GeoIPUpdater::new(
+        opt.update_minutes,
+        db.clone(),
+        opt.account_id,
+        opt.license_key,
+        opt.edition_id,
+    );
+    updater.start();
 
     HttpServer::new(move || {
         App::new()
@@ -235,8 +255,8 @@ async fn main() {
             .wrap(Cors::new().send_wildcard().finish())
             .route("/", web::route().to(index))
     })
-    .bind(format!("{}:{}", host, port))
-    .unwrap_or_else(|_| panic!("Can not bind to {}:{}", host, port))
+    .bind(opt.listen_addr)
+    .unwrap_or_else(|_| panic!("Can not bind to {}", listen_addr))
     .run()
     .await
     .unwrap();
