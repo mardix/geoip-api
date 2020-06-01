@@ -15,23 +15,28 @@
 #[macro_use]
 extern crate serde_derive;
 
-use env_logger;
-use std::net::Ipv4Addr;
-use std::net::Ipv6Addr;
-use std::sync::{Arc, RwLock};
-
 use actix_cors::Cors;
 use actix_web::http::HeaderMap;
 use actix_web::web;
 use actix_web::App;
 use actix_web::HttpRequest;
-use actix_web::Responder;
 use actix_web::HttpServer;
-use maxminddb::geoip2::City;
-use serde_json;
-use std::net::SocketAddr;
-use structopt::StructOpt;
+use actix_web::Responder;
+use actix_web_prom::PrometheusMetrics;
+
+use env_logger;
 use geoipupdate::MaxMindReader;
+use maxminddb::geoip2::City;
+use prometheus::{opts, IntCounter, IntGauge};
+use serde_json;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
+use structopt::StructOpt;
+
+use geoipupdate::GeoIPUpdater;
+use geoipupdate::GeoIPUpdaterMetrics;
 
 mod geoipupdate;
 
@@ -57,7 +62,7 @@ struct Options {
 #[derive(Serialize)]
 struct NonResolvedIPResponse<'a> {
     pub ip_address: &'a str,
-    pub error: &'a str
+    pub error: &'a str,
 }
 
 #[derive(Serialize)]
@@ -224,7 +229,7 @@ async fn index(
         }
         Err(e) => serde_json::to_string(&NonResolvedIPResponse {
             ip_address: &ip_address,
-            error: &e.to_string()
+            error: &e.to_string(),
         }),
     }
     .unwrap()
@@ -236,16 +241,61 @@ async fn main() {
     let opt = Options::from_args();
     let listen_addr = opt.listen_addr;
 
+    let prometheus = PrometheusMetrics::new("geoip", Some("/metrics"), None);
+
+    let last_updated_opts = opts!(
+        "database_last_updated",
+        "timestamp of the last time the geoip database was modified"
+    )
+    .namespace("geoip");
+    let last_updated = IntGauge::with_opts(last_updated_opts).unwrap();
+
+    let last_checked_opts = opts!(
+        "database_last_checked",
+        "timestamp of the last time an update was checked for the geoip database"
+    )
+    .namespace("geoip");
+    let last_checked = IntGauge::with_opts(last_checked_opts).unwrap();
+
+    let error_count_opts = opts!(
+        "geoip_update_errors",
+        "number of errors fetching the geoip database"
+    )
+    .namespace("geoip");
+    let error_count = IntCounter::with_opts(error_count_opts).unwrap();
+
+    prometheus
+        .registry
+        .register(Box::new(last_updated.clone()))
+        .unwrap();
+
+    prometheus
+        .registry
+        .register(Box::new(last_checked.clone()))
+        .unwrap();
+
+    prometheus
+        .registry
+        .register(Box::new(error_count.clone()))
+        .unwrap();
+
     println!("Listening on http://{}", listen_addr);
 
     let db = Arc::new(RwLock::new(None));
 
-    let updater = geoipupdate::GeoIPUpdater::new(
+    let updater_metrics = GeoIPUpdaterMetrics::new(
+        last_updated.clone(),
+        last_checked.clone(),
+        error_count.clone(),
+    );
+
+    let updater = GeoIPUpdater::new(
         opt.update_minutes,
         db.clone(),
         opt.account_id,
         opt.license_key,
         opt.edition_id,
+        updater_metrics,
     );
     updater.start();
 
@@ -253,6 +303,7 @@ async fn main() {
         App::new()
             .data(Db { db: db.clone() })
             .wrap(Cors::new().send_wildcard().finish())
+            .wrap(prometheus.clone())
             .route("/", web::route().to(index))
     })
     .bind(opt.listen_addr)
