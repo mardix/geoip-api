@@ -1,43 +1,28 @@
-// Copyright 2019 Federico Fissore
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #[macro_use]
 extern crate serde_derive;
 
 use actix_cors::Cors;
-use actix_web::http::HeaderMap;
-use actix_web::web;
-use actix_web::App;
-use actix_web::HttpRequest;
-use actix_web::HttpServer;
-use actix_web::Responder;
+use actix_web::{web, App, HttpRequest, HttpServer};
 use actix_web_prom::PrometheusMetrics;
 
 use env_logger;
 use geoipupdate::MaxMindReader;
 use maxminddb::geoip2::City;
 use prometheus::{opts, IntCounter, IntGauge};
-use serde_json;
+
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+
 use structopt::StructOpt;
+
+use error::GeoIPError;
 
 use geoipupdate::GeoIPUpdater;
 use geoipupdate::GeoIPUpdaterMetrics;
 
+mod error;
 mod geoipupdate;
 
 #[derive(StructOpt, Debug, Clone)]
@@ -45,70 +30,42 @@ struct Options {
     #[structopt(
         short,
         long,
-        env = "GEOIP_RS_LISTEN_ADDR",
+        env = "GEOIP_API_LISTEN_ADDR",
         default_value = "127.0.0.1:3000"
     )]
     listen_addr: SocketAddr,
-    #[structopt(long, env = "GEOIP_RS_UPDATE_MINUTES", default_value = "30")]
+    #[structopt(long, env = "GEOIP_API_UPDATE_MINUTES", default_value = "30")]
     update_minutes: u64,
-    #[structopt(long, env = "GEOIP_RS_ACCOUNT_ID")]
+    #[structopt(long, env = "GEOIP_API_ACCOUNT_ID")]
     account_id: String,
-    #[structopt(long, env = "GEOIP_RS_LICENSE_KEY")]
+    #[structopt(long, env = "GEOIP_API_LICENSE_KEY")]
     license_key: String,
-    #[structopt(long, env = "GEOIP_RS_EDITION_ID", default_value = "GeoIP2-City")]
+    #[structopt(long, env = "GEOIP_API_EDITION_ID", default_value = "GeoIP2-City")]
     edition_id: String,
 }
 
 #[derive(Serialize)]
-struct NonResolvedIPResponse<'a> {
-    pub ip_address: &'a str,
-    pub error: &'a str,
-}
-
-#[derive(Serialize)]
-struct ResolvedIPResponse<'a> {
-    pub ip_address: &'a str,
-    pub latitude: &'a f64,
-    pub longitude: &'a f64,
-    pub postal_code: &'a str,
-    pub continent_code: &'a str,
-    pub continent_name: &'a str,
-    pub country_code: &'a str,
-    pub country_name: &'a str,
-    pub region_code: &'a str,
-    pub region_name: &'a str,
-    pub province_code: &'a str,
-    pub province_name: &'a str,
-    pub city_name: &'a str,
-    pub timezone: &'a str,
+struct ResolvedIPResponse {
+    pub ip_address: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub postal_code: String,
+    pub continent_code: String,
+    pub continent_name: String,
+    pub country_code: String,
+    pub country_name: String,
+    pub region_code: String,
+    pub region_name: String,
+    pub province_code: String,
+    pub province_name: String,
+    pub city_name: String,
+    pub timezone: String,
 }
 
 #[derive(Deserialize, Debug)]
 struct QueryParams {
     ip: Option<String>,
     lang: Option<String>,
-    callback: Option<String>,
-}
-
-fn ip_address_to_resolve(
-    ip: Option<String>,
-    headers: &HeaderMap,
-    remote_addr: Option<&str>,
-) -> String {
-    ip.filter(|ip_address| {
-        ip_address.parse::<Ipv4Addr>().is_ok() || ip_address.parse::<Ipv6Addr>().is_ok()
-    })
-    .or_else(|| {
-        headers
-            .get("X-Real-IP")
-            .map(|s| s.to_str().unwrap().to_string())
-    })
-    .or_else(|| {
-        remote_addr
-            .map(|ip_port| ip_port.split(':').take(1).last().unwrap())
-            .map(|ip| ip.to_string())
-    })
-    .expect("unable to find ip address to resolve")
 }
 
 fn get_language(lang: Option<String>) -> String {
@@ -120,119 +77,108 @@ struct Db {
 }
 
 async fn index(
-    req: HttpRequest,
+    _req: HttpRequest,
     data: web::Data<Db>,
     web::Query(query): web::Query<QueryParams>,
-) -> impl Responder {
+) -> Result<web::Json<ResolvedIPResponse>, GeoIPError> {
     let language = get_language(query.lang);
-    let ip_address = ip_address_to_resolve(query.ip, req.headers(), req.connection_info().remote());
+    let ip_address = query
+        .ip
+        .filter(|ip_address| {
+            ip_address.parse::<Ipv4Addr>().is_ok() || ip_address.parse::<Ipv6Addr>().is_ok()
+        })
+        .ok_or(GeoIPError::ParseError)?;
 
-    let db_opt = data.db.as_ref().read().unwrap();
-    let lookup: Result<City, Box<dyn std::error::Error>> = if let Some(db) = &*db_opt {
+    let db_opt = data
+        .db
+        .as_ref()
+        .read()
+        .map_err(|_| GeoIPError::PoisonError)?;
+
+    let geoip: City = if let Some(db) = &*db_opt {
+        // we can unwrap here because we parsed previously
         db.lookup(ip_address.parse().unwrap())
-            .map_err(|e| format!("Could not query maxmind database: {}", e).into())
     } else {
-        Err("Maxmind database not found".into())
-    };
+        Err(GeoIPError::DatabaseNotFound)?
+    }?;
 
-    match lookup {
-        Ok(geoip) => {
-            let region = geoip
-                .subdivisions
-                .as_ref()
-                .filter(|subdivs| !subdivs.is_empty())
-                .and_then(|subdivs| subdivs.get(0));
+    let region = geoip
+        .subdivisions
+        .as_ref()
+        .filter(|subdivs| !subdivs.is_empty())
+        .and_then(|subdivs| subdivs.get(0));
 
-            let province = geoip
-                .subdivisions
-                .as_ref()
-                .filter(|subdivs| subdivs.len() > 1)
-                .and_then(|subdivs| subdivs.get(1));
+    let province = geoip
+        .subdivisions
+        .as_ref()
+        .filter(|subdivs| subdivs.len() > 1)
+        .and_then(|subdivs| subdivs.get(1));
 
-            let res = ResolvedIPResponse {
-                ip_address: &ip_address,
-                latitude: geoip
-                    .location
-                    .as_ref()
-                    .and_then(|loc| loc.latitude.as_ref())
-                    .unwrap_or(&0.0),
-                longitude: geoip
-                    .location
-                    .as_ref()
-                    .and_then(|loc| loc.longitude.as_ref())
-                    .unwrap_or(&0.0),
-                postal_code: geoip
-                    .postal
-                    .as_ref()
-                    .and_then(|postal| postal.code.as_ref())
-                    .map(String::as_str)
-                    .unwrap_or(""),
-                continent_code: geoip
-                    .continent
-                    .as_ref()
-                    .and_then(|cont| cont.code.as_ref())
-                    .map(String::as_str)
-                    .unwrap_or(""),
-                continent_name: geoip
-                    .continent
-                    .as_ref()
-                    .and_then(|cont| cont.names.as_ref())
-                    .and_then(|names| names.get(&language))
-                    .map(String::as_str)
-                    .unwrap_or(""),
-                country_code: geoip
-                    .country
-                    .as_ref()
-                    .and_then(|country| country.iso_code.as_ref())
-                    .map(String::as_str)
-                    .unwrap_or(""),
-                country_name: geoip
-                    .country
-                    .as_ref()
-                    .and_then(|country| country.names.as_ref())
-                    .and_then(|names| names.get(&language))
-                    .map(String::as_str)
-                    .unwrap_or(""),
-                region_code: region
-                    .and_then(|subdiv| subdiv.iso_code.as_ref())
-                    .map(String::as_ref)
-                    .unwrap_or(""),
-                region_name: region
-                    .and_then(|subdiv| subdiv.names.as_ref())
-                    .and_then(|names| names.get(&language))
-                    .map(String::as_ref)
-                    .unwrap_or(""),
-                province_code: province
-                    .and_then(|subdiv| subdiv.iso_code.as_ref())
-                    .map(String::as_ref)
-                    .unwrap_or(""),
-                province_name: province
-                    .and_then(|subdiv| subdiv.names.as_ref())
-                    .and_then(|names| names.get(&language))
-                    .map(String::as_ref)
-                    .unwrap_or(""),
-                city_name: geoip
-                    .city
-                    .as_ref()
-                    .and_then(|city| city.names.as_ref())
-                    .and_then(|names| names.get(&language))
-                    .map(String::as_str)
-                    .unwrap_or(""),
-                timezone: geoip
-                    .location
-                    .as_ref()
-                    .and_then(|loc| loc.time_zone.as_ref())
-                    .map(String::as_str)
-                    .unwrap_or(""),
-            };
-            serde_json::to_string(&res)
-        }
-        Err(e) => serde_json::to_string(&NonResolvedIPResponse {
-            ip_address: &ip_address,
-            error: &e.to_string(),
-        }),
-    }
-    .unwrap()
+    Ok(web::Json(ResolvedIPResponse {
+        ip_address: ip_address.to_owned(),
+        latitude: geoip
+            .location
+            .as_ref()
+            .and_then(|loc| loc.latitude)
+            .unwrap_or(0.0),
+        longitude: geoip
+            .location
+            .as_ref()
+            .and_then(|loc| loc.longitude)
+            .unwrap_or(0.0),
+        postal_code: geoip
+            .postal
+            .as_ref()
+            .and_then(|postal| postal.code.clone())
+            .unwrap_or("".to_owned()),
+        continent_code: geoip
+            .continent
+            .as_ref()
+            .and_then(|cont| cont.code.clone())
+            .unwrap_or("".to_owned()),
+        continent_name: geoip
+            .continent
+            .as_ref()
+            .and_then(|cont| cont.names.as_ref())
+            .and_then(|names| names.get(&language).cloned())
+            .unwrap_or("".to_owned()),
+        country_code: geoip
+            .country
+            .as_ref()
+            .and_then(|country| country.iso_code.clone())
+            .unwrap_or("".to_owned()),
+        country_name: geoip
+            .country
+            .as_ref()
+            .and_then(|country| country.names.as_ref())
+            .and_then(|names| names.get(&language).cloned())
+            .unwrap_or("".to_owned()),
+        region_code: region
+            .and_then(|subdiv| subdiv.iso_code.clone())
+            .unwrap_or("".to_owned()),
+        region_name: region
+            .and_then(|subdiv| subdiv.names.as_ref())
+            .and_then(|names| names.get(&language).cloned())
+            .unwrap_or("".to_owned()),
+        province_code: province
+            .and_then(|subdiv| subdiv.iso_code.clone())
+            .unwrap_or("".to_owned()),
+        province_name: province
+            .and_then(|subdiv| subdiv.names.as_ref())
+            .and_then(|names| names.get(&language).cloned())
+            .unwrap_or("".to_owned()),
+        city_name: geoip
+            .city
+            .as_ref()
+            .and_then(|city| city.names.as_ref())
+            .and_then(|names| names.get(&language).cloned())
+            .unwrap_or("".to_owned()),
+        timezone: geoip
+            .location
+            .as_ref()
+            .and_then(|loc| loc.time_zone.clone())
+            .unwrap_or("".to_owned()),
+    }))
 }
 
 #[actix_rt::main]

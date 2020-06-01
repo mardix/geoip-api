@@ -8,8 +8,8 @@ RUN apk --update add ca-certificates
 
 FROM scratch
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build /home/rust/src/target/x86_64-unknown-linux-musl/release/geoip-rs /
+COPY --from=build /home/rust/src/target/x86_64-unknown-linux-musl/release/geoip-api /
 USER 1000
 ENV RUST_LOG WARN
-CMD ["/geoip-rs"]
+CMD ["/geoip-api"]
 EXPOSE 3000/tcp
