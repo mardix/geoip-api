@@ -8,8 +8,6 @@ pub enum GeoIPError {
     PoisonError,
     #[error("GeoIP Database Not Found")]
     DatabaseNotFound,
-    // #[error("invalid header (expected {expected:?}, found {found:?})")]
-    // InvalidHeader { expected: String, found: String },
     #[error("Could not parse given IP")]
     ParseError,
     #[error(transparent)]
