@@ -181,6 +181,20 @@ async fn index(
     }))
 }
 
+async fn health(_req: HttpRequest, data: web::Data<Db>) -> Result<&'static str, GeoIPError> {
+    let db_opt = data
+        .db
+        .as_ref()
+        .read()
+        .map_err(|_| GeoIPError::PoisonError)?;
+
+    if let Some(_db) = &*db_opt {
+        Ok("OK")
+    } else {
+        Err(GeoIPError::DatabaseNotFound)?
+    }
+}
+
 #[actix_rt::main]
 async fn main() {
     env_logger::init();
@@ -225,8 +239,6 @@ async fn main() {
         .register(Box::new(error_count.clone()))
         .unwrap();
 
-    println!("Listening on http://{}", listen_addr);
-
     let db = Arc::new(RwLock::new(None));
 
     let updater_metrics = GeoIPUpdaterMetrics::new(
@@ -245,12 +257,15 @@ async fn main() {
     );
     updater.start();
 
+    println!("Listening on http://{}", listen_addr);
+
     HttpServer::new(move || {
         App::new()
             .data(Db { db: db.clone() })
             .wrap(Cors::new().send_wildcard().finish())
             .wrap(prometheus.clone())
             .route("/", web::route().to(index))
+            .route("/health", web::route().to(health))
     })
     .bind(opt.listen_addr)
     .unwrap_or_else(|_| panic!("Can not bind to {}", listen_addr))

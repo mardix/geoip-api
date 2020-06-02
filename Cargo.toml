@@ -1,7 +1,7 @@
 [package]
 name = "geoip-api"
 description = "geoip-api provides geographical information about the specified IP address with an auto-updating database"
-version = "0.7.0"
+version = "0.7.1"
 authors = ["Matthew Wynn <matthew@matthewwynn.com>"]
 edition = "2018"
 license = "Apache-2.0"
