@@ -1,6 +1,7 @@
 FROM ekidd/rust-musl-builder:latest AS build
 COPY ./src ./src
 COPY Cargo.toml Cargo.lock ./
+ENV RUSTFLAGS='-C target-cpu=skylake'
 RUN cargo build --release
 
 FROM alpine:latest as certs

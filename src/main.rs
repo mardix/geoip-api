@@ -2,7 +2,7 @@
 extern crate serde_derive;
 
 use actix_cors::Cors;
-use actix_web::{web, App, HttpRequest, HttpServer};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
 use actix_web_prom::PrometheusMetrics;
 
 use env_logger;
@@ -10,10 +10,9 @@ use geoipupdate::MaxMindReader;
 use maxminddb::geoip2::City;
 use prometheus::{opts, IntCounter, IntGauge};
 
-use std::net::Ipv4Addr;
-use std::net::Ipv6Addr;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex, RwLock};
 
 use structopt::StructOpt;
 
@@ -21,6 +20,7 @@ use error::GeoIPError;
 
 use geoipupdate::GeoIPUpdater;
 use geoipupdate::GeoIPUpdaterMetrics;
+use lru_time_cache::LruCache;
 
 mod error;
 mod geoipupdate;
@@ -45,21 +45,21 @@ struct Options {
 }
 
 #[derive(Serialize)]
-struct ResolvedIPResponse {
-    pub ip_address: String,
-    pub latitude: f64,
-    pub longitude: f64,
-    pub postal_code: String,
-    pub continent_code: String,
-    pub continent_name: String,
-    pub country_code: String,
-    pub country_name: String,
-    pub region_code: String,
-    pub region_name: String,
-    pub province_code: String,
-    pub province_name: String,
-    pub city_name: String,
-    pub timezone: String,
+struct ResolvedIPResponse<'a> {
+    pub ip_address: &'a str,
+    pub latitude: &'a f64,
+    pub longitude: &'a f64,
+    pub postal_code: &'a str,
+    pub continent_code: &'a str,
+    pub continent_name: &'a str,
+    pub country_code: &'a str,
+    pub country_name: &'a str,
+    pub region_code: &'a str,
+    pub region_name: &'a str,
+    pub province_code: &'a str,
+    pub province_name: &'a str,
+    pub city_name: &'a str,
+    pub timezone: &'a str,
 }
 
 #[derive(Deserialize, Debug)]
@@ -72,15 +72,12 @@ fn get_language(lang: Option<String>) -> String {
     lang.unwrap_or_else(|| String::from("en"))
 }
 
-struct Db {
-    db: Arc<RwLock<MaxMindReader>>,
-}
-
 async fn index(
     _req: HttpRequest,
-    data: web::Data<Db>,
+    db: web::Data<RwLock<MaxMindReader>>,
+    lru: web::Data<Arc<Mutex<LruCache<String, City>>>>,
     web::Query(query): web::Query<QueryParams>,
-) -> Result<web::Json<ResolvedIPResponse>, GeoIPError> {
+) -> Result<HttpResponse, GeoIPError> {
     let language = get_language(query.lang);
     let ip_address = query
         .ip
@@ -89,18 +86,27 @@ async fn index(
         })
         .ok_or(GeoIPError::ParseError)?;
 
-    let db_opt = data
-        .db
-        .as_ref()
-        .read()
-        .map_err(|_| GeoIPError::PoisonError)?;
+    let cached_city = {
+        let mut open_lru = lru.as_ref().lock().map_err(|_| GeoIPError::PoisonError)?;
+        open_lru.get(&ip_address).cloned()
+    };
 
-    let geoip: City = if let Some(db) = &*db_opt {
-        // we can unwrap here because we parsed previously
-        db.lookup(ip_address.parse().unwrap())
-    } else {
-        Err(GeoIPError::DatabaseNotFound)?
-    }?;
+    let geoip = match cached_city {
+        Some(city) => city,
+        None => {
+            let db_opt = db.as_ref().read().map_err(|_| GeoIPError::PoisonError)?;
+
+            let geoip: City = if let Some(db) = &*db_opt {
+                // we can unwrap here because we parsed previously
+                db.lookup(ip_address.parse().unwrap())
+            } else {
+                Err(GeoIPError::DatabaseNotFound)?
+            }?;
+            let mut open_lru = lru.as_ref().lock().map_err(|_| GeoIPError::PoisonError)?;
+            open_lru.insert(ip_address.clone(), geoip.clone());
+            geoip
+        }
+    };
 
     let region = geoip
         .subdivisions
@@ -114,79 +120,91 @@ async fn index(
         .filter(|subdivs| subdivs.len() > 1)
         .and_then(|subdivs| subdivs.get(1));
 
-    Ok(web::Json(ResolvedIPResponse {
-        ip_address: ip_address.to_owned(),
+    let resp = ResolvedIPResponse {
+        ip_address: &ip_address,
         latitude: geoip
             .location
             .as_ref()
-            .and_then(|loc| loc.latitude)
-            .unwrap_or(0.0),
+            .and_then(|loc| loc.latitude.as_ref())
+            .unwrap_or(&0.0),
         longitude: geoip
             .location
             .as_ref()
-            .and_then(|loc| loc.longitude)
-            .unwrap_or(0.0),
+            .and_then(|loc| loc.longitude.as_ref())
+            .unwrap_or(&0.0),
         postal_code: geoip
             .postal
             .as_ref()
-            .and_then(|postal| postal.code.clone())
-            .unwrap_or("".to_owned()),
+            .and_then(|postal| postal.code.as_ref())
+            .map(String::as_str)
+            .unwrap_or(""),
         continent_code: geoip
             .continent
             .as_ref()
-            .and_then(|cont| cont.code.clone())
-            .unwrap_or("".to_owned()),
+            .and_then(|cont| cont.code.as_ref())
+            .map(String::as_str)
+            .unwrap_or(""),
         continent_name: geoip
             .continent
             .as_ref()
             .and_then(|cont| cont.names.as_ref())
-            .and_then(|names| names.get(&language).cloned())
-            .unwrap_or("".to_owned()),
+            .and_then(|names| names.get(&language))
+            .map(String::as_str)
+            .unwrap_or(""),
         country_code: geoip
             .country
             .as_ref()
-            .and_then(|country| country.iso_code.clone())
-            .unwrap_or("".to_owned()),
+            .and_then(|country| country.iso_code.as_ref())
+            .map(String::as_str)
+            .unwrap_or(""),
         country_name: geoip
             .country
             .as_ref()
             .and_then(|country| country.names.as_ref())
-            .and_then(|names| names.get(&language).cloned())
-            .unwrap_or("".to_owned()),
+            .and_then(|names| names.get(&language))
+            .map(String::as_str)
+            .unwrap_or(""),
         region_code: region
-            .and_then(|subdiv| subdiv.iso_code.clone())
-            .unwrap_or("".to_owned()),
+            .and_then(|subdiv| subdiv.iso_code.as_ref())
+            .map(String::as_str)
+            .unwrap_or(""),
         region_name: region
             .and_then(|subdiv| subdiv.names.as_ref())
-            .and_then(|names| names.get(&language).cloned())
-            .unwrap_or("".to_owned()),
+            .and_then(|names| names.get(&language))
+            .map(String::as_str)
+            .unwrap_or(""),
         province_code: province
-            .and_then(|subdiv| subdiv.iso_code.clone())
-            .unwrap_or("".to_owned()),
+            .and_then(|subdiv| subdiv.iso_code.as_ref())
+            .map(String::as_str)
+            .unwrap_or(""),
         province_name: province
             .and_then(|subdiv| subdiv.names.as_ref())
-            .and_then(|names| names.get(&language).cloned())
-            .unwrap_or("".to_owned()),
+            .and_then(|names| names.get(&language))
+            .map(String::as_str)
+            .unwrap_or(""),
         city_name: geoip
             .city
             .as_ref()
             .and_then(|city| city.names.as_ref())
-            .and_then(|names| names.get(&language).cloned())
-            .unwrap_or("".to_owned()),
+            .and_then(|names| names.get(&language))
+            .map(String::as_str)
+            .unwrap_or(""),
         timezone: geoip
             .location
             .as_ref()
-            .and_then(|loc| loc.time_zone.clone())
-            .unwrap_or("".to_owned()),
-    }))
+            .and_then(|loc| loc.time_zone.as_ref())
+            .map(String::as_str)
+            .unwrap_or(""),
+    };
+
+    Ok(HttpResponse::Ok().json(resp))
 }
 
-async fn health(_req: HttpRequest, data: web::Data<Db>) -> Result<&'static str, GeoIPError> {
-    let db_opt = data
-        .db
-        .as_ref()
-        .read()
-        .map_err(|_| GeoIPError::PoisonError)?;
+async fn health(
+    _req: HttpRequest,
+    db: web::Data<RwLock<MaxMindReader>>,
+) -> Result<&'static str, GeoIPError> {
+    let db_opt = db.as_ref().read().map_err(|_| GeoIPError::PoisonError)?;
 
     if let Some(_db) = &*db_opt {
         Ok("OK")
@@ -239,7 +257,12 @@ async fn main() {
         .register(Box::new(error_count.clone()))
         .unwrap();
 
-    let db = Arc::new(RwLock::new(None));
+    let ttl = ::std::time::Duration::from_secs(3600);
+
+    let lru = web::Data::new(Arc::new(Mutex::new(
+        LruCache::<String, City>::with_expiry_duration_and_capacity(ttl, 2000),
+    )));
+    let db: web::Data<RwLock<MaxMindReader>> = web::Data::new(RwLock::new(None));
 
     let updater_metrics = GeoIPUpdaterMetrics::new(
         last_updated.clone(),
@@ -249,7 +272,7 @@ async fn main() {
 
     let updater = GeoIPUpdater::new(
         opt.update_minutes,
-        db.clone(),
+        db.clone().into_inner(),
         opt.account_id,
         opt.license_key,
         opt.edition_id,
@@ -261,7 +284,8 @@ async fn main() {
 
     HttpServer::new(move || {
         App::new()
-            .data(Db { db: db.clone() })
+            .app_data(db.clone())
+            .app_data(lru.clone())
             .wrap(Cors::new().send_wildcard().finish())
             .wrap(prometheus.clone())
             .route("/", web::route().to(index))
