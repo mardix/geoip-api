@@ -1,7 +1,7 @@
 [package]
 name = "geoip-api"
 description = "geoip-api provides geographical information about the specified IP address with an auto-updating database"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Matthew Wynn <matthew@matthewwynn.com>"]
 edition = "2018"
 license = "Apache-2.0"
@@ -17,7 +17,6 @@ chrono = "0.4"
 env_logger = "0.7"
 flate2 = "1.0"
 log = "0.4"
-maxminddb = { version = "0.13.0" }
 md5 = "0.7"
 prometheus = "0.8"
 serde = "1"
@@ -26,7 +25,6 @@ serde_json = "1"
 structopt = "0.3"
 thiserror = "1.0"
 tokio = "0.2"
-lru_time_cache = "0.10"
 
 [dependencies.actix-web]
 version = "2"
@@ -36,3 +34,10 @@ default_features = false
 version = "0.10"
 default_features = false
 features = ["rustls-tls"]
+
+[dependencies.maxminddb]
+version = "0.14"
+# This feature does not validate that strings in the maxminddb are valid utf-8
+# However, we do verify the checksum of the maxminddb and do not use the strings
+# in a super sensitive way
+features = ["unsafe-str-decode"]
